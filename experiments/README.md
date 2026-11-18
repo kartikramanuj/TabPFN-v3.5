@@ -29,6 +29,10 @@ The default version list is taken from `tabpfn.constants.ModelVersion` in the
 included source: `v2`, `v2.5`, `v2.6`, `v3`, `v3.5`, and `v3.5-fast`. Default
 baselines are dummy, linear, tree ensemble, and LightGBM estimators.
 
+## Results
+
+Raw results are stored in `experiments/results/raw_results/`, and processed results are stored in `experiments/results/processed_results/`.
+
 ## Artifacts
 
 - `results/raw_results/`: one row per model, seed, and status; includes errors so a
