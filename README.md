@@ -6,6 +6,9 @@ baselines on a tabular dataset. The upstream implementation, examples, documenta
 and tests are preserved in this repository. The experiment code is isolated in
 [`experiments/`](experiments/).
 
+The planned three-way contribution split is documented in
+[`CONTRIBUTION_PLAN.md`](CONTRIBUTION_PLAN.md).
+
 ## What is included
 
 - TabPFN checkpoints: `v2`, `v2.5`, `v2.6`, `v3`, `v3.5`, and `v3.5-fast`.
