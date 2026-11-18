@@ -1,0 +1,16 @@
+task: classification
+data_path: experiments/datasets/raw/your_dataset.csv
+target: target
+categorical_columns: []
+test_size: 0.2
+random_seeds: [17, 42, 2026]
+device: auto
+n_estimators: auto
+tabpfn_versions: [v2, v2.5, v2.6, v3, v3.5, v3.5-fast]
+baseline_models:
+  - dummy
+  - logistic_regression
+  - random_forest
+  - extra_trees
+  - lightgbm
+metrics: [accuracy, balanced_accuracy, f1_macro, roc_auc_ovr_macro, log_loss]

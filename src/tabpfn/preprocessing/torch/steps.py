@@ -1,0 +1,676 @@
+#  Copyright (c) Prior Labs GmbH 2026.
+
+"""Pipeline step wrappers for torch preprocessing operations."""
+
+from __future__ import annotations
+
+from typing import Literal
+from typing_extensions import override
+
+import numpy as np
+import torch
+
+from tabpfn.preprocessing.datamodel import FeatureModality, FeatureSchema
+from tabpfn.preprocessing.steps.add_fingerprint_features_step import (
+    AddFingerprintFeaturesStep,
+)
+from tabpfn.preprocessing.steps.add_svd_features_step import get_svd_n_components
+from tabpfn.preprocessing.torch.pipeline_interface import (
+    IN_PLACE_BLOCK_BYTES,
+    TorchPreprocessingStep,
+    TorchPreprocessingStepResult,
+)
+from tabpfn.preprocessing.torch.torch_quantile_transformer import (
+    TorchQuantileTransformer,
+)
+from tabpfn.preprocessing.torch.torch_robust_scaler import TorchRobustScaler
+from tabpfn.preprocessing.torch.torch_safe_power_transformer import (
+    TorchSafePowerTransformer,
+)
+from tabpfn.preprocessing.torch.torch_soft_clip_outliers import TorchSoftClipOutliers
+from tabpfn.preprocessing.torch.torch_squashing_scaler import TorchSquashingScaler
+from tabpfn.preprocessing.torch.torch_standard_scaler import TorchStandardScaler
+from tabpfn.preprocessing.torch.torch_svd import (
+    TorchSafeStandardScaler,
+    TorchTruncatedSVD,
+)
+from tabpfn.utils import infer_random_state
+
+
+class TorchSelectiveStep(TorchPreprocessingStep):
+    """A step that transforms only the columns CPU preprocessing marked for it.
+
+    The marked columns are known when the step is built, and the pipeline passes
+    them as `column_indices`.
+    """
+
+    columnwise = True
+
+    _target_column_indices: list[int]
+
+    @override
+    def target_columns(
+        self,
+        feature_schema: FeatureSchema,
+        modalities: set[FeatureModality] | None,
+    ) -> list[int]:
+        return list(self._target_column_indices)
+
+
+class TorchRandomSignFlipStep(TorchPreprocessingStep):
+    """Randomly negate columns with signs shared across rows."""
+
+    runs_on_input_device = True
+
+    def __init__(self, random_state: int | np.random.Generator | None) -> None:
+        super().__init__()
+        # A fixed seed also preserves signs when inference recomputes preprocessing.
+        self.seed, _ = infer_random_state(random_state)
+
+    @override
+    def fit_transform(
+        self,
+        x: torch.Tensor,
+        column_indices: list[int],
+        num_train_rows: int,
+        fitted_cache: dict[str, torch.Tensor] | None = None,
+        *,
+        in_place: bool = False,
+    ) -> TorchPreprocessingStepResult:
+        if fitted_cache is None:
+            # Fitting needs only the shape; slicing avoids gathering the table.
+            fitted_cache = self._fit(x[:0, :, : len(column_indices)])
+
+        signs = fitted_cache["signs"].to(x)
+        # Runs of evenly spaced columns, multiplied where they are, leave the other
+        # columns' bits as they were.
+        transformed = x if in_place else x.clone()
+        start = 0
+        while start < len(column_indices):
+            end = start + 1
+            stride = (
+                max(1, column_indices[end] - column_indices[start])
+                if end < len(column_indices)
+                else 1
+            )
+            while (
+                end < len(column_indices)
+                and column_indices[end] == column_indices[end - 1] + stride
+            ):
+                end += 1
+            transformed[
+                ..., column_indices[start] : column_indices[end - 1] + 1 : stride
+            ].mul_(signs[..., start:end])
+            start = end
+
+        return TorchPreprocessingStepResult(x=transformed, fitted_cache=fitted_cache)
+
+    @override
+    def _fit(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
+        rng = np.random.default_rng(self.seed)
+        signs = rng.integers(0, 2, size=(1, x.shape[1], x.shape[2])).astype(np.int8)
+        signs *= -2
+        signs += 1
+        return {"signs": torch.as_tensor(signs, device=x.device)}
+
+    @override
+    def _transform(
+        self, x: torch.Tensor, fitted_cache: dict[str, torch.Tensor]
+    ) -> tuple[torch.Tensor, None, None]:
+        raise NotImplementedError("`fit_transform` applies the signs.")
+
+
+class TorchQuantileTransformerStep(TorchPreprocessingStep):
+    """Pipeline step wrapper for TorchQuantileTransformer."""
+
+    def __init__(
+        self,
+        n_quantiles: int = 1_000,
+        extrapolate_ratio: float | None = None,
+    ) -> None:
+        """Initialize the quantile transformer step."""
+        super().__init__()
+        self._quantile_transformer = TorchQuantileTransformer(
+            n_quantiles=n_quantiles,
+            extrapolate_ratio=extrapolate_ratio,
+        )
+
+    @override
+    def _fit(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
+        """Fit the quantile transformer on the selected columns."""
+        return self._quantile_transformer.fit(x)
+
+    @override
+    def _transform(
+        self, x: torch.Tensor, fitted_cache: dict[str, torch.Tensor]
+    ) -> tuple[torch.Tensor, torch.Tensor | None, FeatureModality | None]:
+        """Transform columns using the fitted quantile transformer."""
+        return (
+            self._quantile_transformer.transform(x, fitted_cache=fitted_cache),
+            None,
+            None,
+        )
+
+
+class TorchStandardScalerStep(TorchPreprocessingStep):
+    """Pipeline step wrapper for TorchStandardScaler."""
+
+    def __init__(self) -> None:
+        """Initialize the standard scaler step."""
+        super().__init__()
+        self._scaler = TorchStandardScaler()
+
+    @override
+    def _fit(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
+        """Fit the scaler on the selected columns."""
+        return self._scaler.fit(x)
+
+    @override
+    def _transform(
+        self,
+        x: torch.Tensor,
+        fitted_cache: dict[str, torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor | None, FeatureModality | None]:
+        """Transform columns using the fitted scaler."""
+        return self._scaler.transform(x, fitted_cache=fitted_cache), None, None
+
+
+class TorchSquashingScalerStep(TorchPreprocessingStep):
+    """Pipeline step wrapper for TorchSquashingScaler."""
+
+    def __init__(
+        self,
+        max_absolute_value: float = 3.0,
+        quantile_range: tuple[float, float] = (25.0, 75.0),
+    ) -> None:
+        """Initialize the squashing scaler step."""
+        super().__init__()
+        self._scaler = TorchSquashingScaler(
+            max_absolute_value=max_absolute_value,
+            quantile_range=quantile_range,
+        )
+
+    @override
+    def _fit(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
+        """Fit the squashing scaler on the selected columns."""
+        return self._scaler.fit(x)
+
+    @override
+    def _transform(
+        self,
+        x: torch.Tensor,
+        fitted_cache: dict[str, torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor | None, FeatureModality | None]:
+        """Transform columns using the fitted squashing scaler."""
+        return self._scaler.transform(x, fitted_cache=fitted_cache), None, None
+
+
+class TorchSoftClipOutliersStep(TorchPreprocessingStep):
+    """Pipeline step wrapper for TorchSoftClipOutliers."""
+
+    columnwise = True
+
+    def __init__(self, n_sigma: float = 4.0) -> None:
+        """Initialize the outlier removal step.
+
+        Args:
+            n_sigma: Number of standard deviations to use for outlier threshold.
+        """
+        super().__init__()
+        self._outlier_remover = TorchSoftClipOutliers(n_sigma=n_sigma)
+
+    @override
+    def _fit(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
+        """Fit the outlier remover on the selected columns."""
+        return self._outlier_remover.fit(x)
+
+    @override
+    def _transform(
+        self,
+        x: torch.Tensor,
+        fitted_cache: dict[str, torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor | None, FeatureModality | None]:
+        """Transform columns using the fitted outlier remover."""
+        return self._outlier_remover.transform(x, fitted_cache=fitted_cache), None, None
+
+
+class TorchSelectiveQuantileTransformerStep(TorchSelectiveStep):
+    """Quantile transformer that only transforms specified column indices.
+
+    This step needs to be registered with ``modalities=None`` in the GPU pipeline so it
+    receives the full tensor. It selects only preconfigured ``target_column_indices``
+    and applies the quantile transform, and writes the results back. All other columns
+    are left unchanged.
+    """
+
+    shared_cache_keys = frozenset({"references"})
+    computes_on_cpu_for_mps = True
+
+    def __init__(
+        self,
+        n_quantiles: int,
+        target_column_indices: list[int],
+        extrapolate_ratio: float | None = None,
+        output_distribution: Literal["uniform", "normal"] = "uniform",
+    ) -> None:
+        super().__init__()
+        self._qt = TorchQuantileTransformer(
+            n_quantiles=n_quantiles,
+            extrapolate_ratio=extrapolate_ratio,
+            output_distribution=output_distribution,
+        )
+        self._target_column_indices = target_column_indices
+
+    @override
+    def _fit(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
+        return self._qt.fit(x)
+
+    @override
+    def _transform(
+        self,
+        x: torch.Tensor,
+        fitted_cache: dict[str, torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor | None, FeatureModality | None]:
+        # `x` is the step's own copy of its columns, so the transform writes over it
+        # and its intermediates sit next to this one buffer only.
+        return self._qt.transform(x, fitted_cache=fitted_cache, out=x), None, None
+
+
+class TorchSelectiveSquashingScalerStep(TorchSelectiveStep):
+    """Squashing scaler that only transforms specified column indices.
+
+    Mirrors :class:`TorchSelectiveQuantileTransformerStep`: this step needs to be
+    registered with ``modalities=None`` in the GPU pipeline so it receives the full
+    tensor. It selects only preconfigured ``target_column_indices`` and applies the
+    squashing scaler, writing the results back. All other columns are left
+    unchanged.
+    """
+
+    computes_on_cpu_for_mps = True
+
+    def __init__(
+        self,
+        max_absolute_value: float,
+        target_column_indices: list[int],
+        quantile_range: tuple[float, float] = (25.0, 75.0),
+    ) -> None:
+        super().__init__()
+        self._scaler = TorchSquashingScaler(
+            max_absolute_value=max_absolute_value,
+            quantile_range=quantile_range,
+        )
+        self._target_column_indices = target_column_indices
+
+    @override
+    def _fit(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
+        return self._scaler.fit(x)
+
+    @override
+    def _transform(
+        self,
+        x: torch.Tensor,
+        fitted_cache: dict[str, torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor | None, FeatureModality | None]:
+        return self._scaler.transform(x, fitted_cache=fitted_cache), None, None
+
+
+class TorchSelectiveSafePowerStep(TorchSelectiveStep):
+    """Safe power transform that only transforms specified column indices.
+
+    Register with ``modalities=None``, like
+    :class:`TorchSelectiveQuantileTransformerStep`.
+    """
+
+    computes_on_cpu_for_mps = True
+
+    def __init__(self, target_column_indices: list[int]) -> None:
+        super().__init__()
+        self._transformer = TorchSafePowerTransformer()
+        self._target_column_indices = target_column_indices
+
+    @override
+    def _fit(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
+        # The transformer flattens the batch into the columns; the block runners
+        # slice and join the cache by columns, along its last dimension.
+        cache = self._transformer.fit(x)
+        return {key: value.reshape(x.shape[1:]) for key, value in cache.items()}
+
+    @override
+    def _transform(
+        self,
+        x: torch.Tensor,
+        fitted_cache: dict[str, torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor | None, FeatureModality | None]:
+        flat = {key: value.reshape(-1) for key, value in fitted_cache.items()}
+        return self._transformer.transform(x, fitted_cache=flat), None, None
+
+
+class TorchSelectiveRobustScalerStep(TorchSelectiveStep):
+    """Robust scaling of the specified column indices.
+
+    Register with ``modalities=None``, like
+    :class:`TorchSelectiveQuantileTransformerStep`.
+    """
+
+    def __init__(self, target_column_indices: list[int]) -> None:
+        super().__init__()
+        self._scaler = TorchRobustScaler()
+        self._target_column_indices = target_column_indices
+
+    @override
+    def _fit(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
+        return self._scaler.fit(x)
+
+    @override
+    def _transform(
+        self,
+        x: torch.Tensor,
+        fitted_cache: dict[str, torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor | None, FeatureModality | None]:
+        return self._scaler.transform(x, fitted_cache=fitted_cache), None, None
+
+
+class TorchShuffleFeaturesStep(TorchPreprocessingStep):
+    """Shuffle features on GPU, consistent with CPU ShuffleFeaturesStep.
+
+    This step needs to be registered with ``modalities=None`` in the GPU pipeline so it
+    receives ALL columns.  It permutes the columns and returns the updated
+    ``schema_permutation`` so the pipeline can update the feature schema.
+
+    The permutation is computed using the same logic and random state as the CPU
+    ``ShuffleFeaturesStep`` to guarantee identical results.
+    """
+
+    runs_on_input_device = True
+
+    def __init__(
+        self,
+        shuffle_method: Literal["shuffle", "rotate"] | None,
+        shuffle_index: int,
+        random_state: int | np.random.Generator | None = None,
+    ) -> None:
+        super().__init__()
+        self.shuffle_method = shuffle_method
+        self.shuffle_index = shuffle_index
+        self.random_state = random_state
+
+    @override
+    def fit_transform(
+        self,
+        x: torch.Tensor,
+        column_indices: list[int],
+        num_train_rows: int,
+        fitted_cache: dict[str, torch.Tensor] | None = None,
+        *,
+        in_place: bool = False,
+    ) -> TorchPreprocessingStepResult:
+        """Override to apply permutation to the full tensor.
+
+        In place, a block of rows at a time, which bounds the permuted copy to one
+        block.
+        """
+        del column_indices
+        if fitted_cache is None:
+            fitted_cache = self._fit(x[:num_train_rows])
+
+        perm = fitted_cache["permutation"]
+        if in_place:
+            row_bytes = x.shape[1] * x.shape[2] * x.element_size()
+            rows = max(1, IN_PLACE_BLOCK_BYTES // max(1, row_bytes))
+            columns = perm.to(x.device)
+            for start in range(0, x.shape[0], rows):
+                x[start : start + rows] = x[start : start + rows][:, :, columns]
+            x_shuffled = x
+        else:
+            x_shuffled = x[:, :, perm.to(x.device)]
+
+        return TorchPreprocessingStepResult(
+            x=x_shuffled,
+            fitted_cache=fitted_cache,
+            schema_permutation=perm.tolist(),
+        )
+
+    @override
+    def _fit(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
+        """Compute the permutation identically to CPU ShuffleFeaturesStep."""
+        n_cols = x.shape[-1]
+        _, rng = infer_random_state(self.random_state)
+
+        if self.shuffle_method == "rotate":
+            perm = np.roll(np.arange(n_cols), self.shuffle_index).tolist()
+        elif self.shuffle_method == "shuffle":
+            perm = rng.permutation(n_cols).tolist()
+        elif self.shuffle_method is None:
+            perm = list(range(n_cols))
+        else:
+            raise ValueError(f"Unknown shuffle method {self.shuffle_method}")
+
+        return {"permutation": torch.tensor(perm, dtype=torch.long)}
+
+    @override
+    def _transform(
+        self,
+        x: torch.Tensor,
+        fitted_cache: dict[str, torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor | None, FeatureModality | None]:
+        perm = fitted_cache["permutation"].to(x.device)
+        return x[:, :, perm], None, None
+
+
+class TorchAddSVDFeaturesStep(TorchPreprocessingStep):
+    """Pipeline step that adds SVD features to the input columns.
+
+    This step applies safe standard scaling (without mean centering) followed
+    by truncated SVD, and appends the SVD components as additional numerical
+    features. The original columns are left unchanged.
+
+    This matches the behavior of the sklearn reshape_feature_distribution_step.
+    """
+
+    def __init__(
+        self,
+        global_transformer_name: Literal["svd", "svd_quarter_components"] = "svd",
+        random_state: int | np.random.Generator | None = None,
+    ) -> None:
+        """Initialize the SVD features step.
+
+        Args:
+            global_transformer_name: Name of the SVD variant. The number of
+                components is computed inside ``_fit`` via
+                :func:`get_svd_n_components`, matching the CPU pipeline.
+            random_state: Seeds the SVD's random projection, as in the CPU
+                :class:`AddSVDFeaturesStep`.
+        """
+        super().__init__()
+        self.global_transformer_name = global_transformer_name
+        self.random_state = random_state
+        self._scaler = TorchSafeStandardScaler()
+        self._svd: TorchTruncatedSVD | None = None
+
+    @override
+    def added_feature_prefix(self) -> str:
+        return "svd"
+
+    @override
+    def _fit(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
+        """Fit the scaler and SVD on the selected columns.
+
+        Args:
+            x: Tensor of selected columns [num_train_rows, batch_size, num_cols].
+
+        Returns:
+            Cache dictionary with scaler and SVD parameters.
+        """
+        num_train_rows = x.shape[0]
+        num_features = x.shape[-1]
+
+        # Mirror the CPU AddSVDFeaturesStep, which is a no-op for fewer than
+        # 2 features (TruncatedSVD needs n_components < n_features).
+        if num_features < 2:
+            return {"is_no_op": torch.tensor(data=True)}
+
+        effective_n_components = get_svd_n_components(
+            self.global_transformer_name,
+            n_samples=num_train_rows,
+            n_features=num_features,
+        )
+
+        static_seed, _ = infer_random_state(self.random_state)
+        self._svd = TorchTruncatedSVD(
+            n_components=effective_n_components,
+            random_state=static_seed,
+        )
+
+        # Fit scaler on training data (flatten batch dimension for fitting)
+        # Shape: [num_train_rows, batch_size, num_cols] -> flattened
+        batch_size = x.shape[1]
+        x_flat = x.reshape(-1, num_features)
+        scaler_cache = self._scaler.fit(x_flat)
+
+        x_scaled = self._scaler.transform(x_flat, scaler_cache)
+        svd_cache = self._svd.fit(x_scaled)
+
+        return {
+            "scaler_std": scaler_cache["std"],
+            "scaler_mean": scaler_cache["mean"],
+            "svd_components": svd_cache["components"],
+            "svd_singular_values": svd_cache["singular_values"],
+            "batch_size": torch.tensor(batch_size),
+            "n_components": torch.tensor(effective_n_components),
+        }
+
+    @override
+    def _transform(
+        self,
+        x: torch.Tensor,
+        fitted_cache: dict[str, torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor | None, FeatureModality | None]:
+        """Transform columns and return original plus SVD features.
+
+        Args:
+            x: Tensor of selected columns [num_rows, batch_size, num_cols].
+            fitted_cache: Cache returned by _fit.
+
+        Returns:
+            Tuple of (original_columns, svd_features, NUMERICAL modality).
+        """
+        if "is_no_op" in fitted_cache:
+            return x, None, None
+
+        num_rows, batch_size, num_features = x.shape
+
+        # Extract caches
+        scaler_cache = {
+            "std": fitted_cache["scaler_std"],
+            "mean": fitted_cache["scaler_mean"],
+        }
+        svd_cache = {
+            "components": fitted_cache["svd_components"],
+            "singular_values": fitted_cache["svd_singular_values"],
+        }
+
+        # Initialize SVD if needed (for transform-only calls)
+        n_components = int(fitted_cache["n_components"].item())
+        if self._svd is None:
+            self._svd = TorchTruncatedSVD(n_components=n_components)
+
+        # Flatten for processing
+        x_flat = x.reshape(-1, num_features)
+
+        x_scaled = self._scaler.transform(x_flat, scaler_cache)
+        svd_features_flat = self._svd.transform(x_scaled, svd_cache)
+        svd_features = svd_features_flat.reshape(num_rows, batch_size, -1)
+
+        # Return original columns unchanged, with SVD features as added columns
+        return x, svd_features, FeatureModality.NUMERICAL
+
+
+class TorchAddFingerprintFeaturesStep(TorchPreprocessingStep):
+    """Add fingerprint features inside the GPU preprocessing pipeline.
+
+    This wraps the CPU-based :class:`AddFingerprintFeaturesStep` so the
+    fingerprint is computed at the *same* position in the pipeline regardless
+    of whether ``enable_gpu_preprocessing`` is on or off.  The hashing itself
+    runs on CPU (SHA-256 is not GPU-acceleratable), but the data movement
+    overhead is negligible for the single added column.
+
+    The step is registered with ``modalities=None`` so it receives the full
+    tensor.  Training rows (``x[:num_train_rows]``) get collision-resolved
+    fingerprints; remaining rows get simple hashes.
+
+    TODO: Implement this on GPU natively.
+    """
+
+    # It hashes on the CPU whatever the device.
+    runs_on_input_device = True
+
+    @override
+    def added_feature_prefix(self) -> str:
+        return "fingerprint"
+
+    @override
+    def fit_transform(
+        self,
+        x: torch.Tensor,
+        column_indices: list[int],
+        num_train_rows: int,
+        fitted_cache: dict[str, torch.Tensor] | None = None,
+        *,
+        in_place: bool = False,
+    ) -> TorchPreprocessingStepResult:
+        """Compute fingerprints and return them as added columns."""
+        del column_indices, in_place  # operates on all columns
+
+        n_rows, batch_size, n_cols = x.shape
+
+        if fitted_cache is None:
+            fitted_cache = {"n_cells": torch.tensor(num_train_rows * n_cols)}
+
+        n_cells = int(fitted_cache["n_cells"].item())
+
+        all_fingerprints = []
+        for b in range(batch_size):
+            x_2d = x[:, b, :]  # [rows, cols]
+
+            step = AddFingerprintFeaturesStep()
+            step.n_cells_ = n_cells
+
+            # Train portion: collision-resolved fingerprints
+            _, fp_train, _ = step._transform(x_2d[:num_train_rows], is_test=False)
+            # Test portion: simple hashes
+            if num_train_rows < n_rows:
+                _, fp_test, _ = step._transform(x_2d[num_train_rows:], is_test=True)
+                fp = torch.cat([fp_train, fp_test], dim=0)  # [rows, 1]
+            else:
+                fp = fp_train  # [rows, 1]
+
+            all_fingerprints.append(fp)
+
+        # Stack across batch: [rows, batch, 1].
+        # Fingerprints are float32 from AddFingerprintFeaturesStep.  Cast to
+        # input dtype for concatenation.  Note that for float16 this loses precision
+        # (~1024 unique values in [0,1)) and won't provide unique identifiers for
+        # training sets larger than 1k rows.
+        added = torch.stack(all_fingerprints, dim=1).to(dtype=x.dtype, device=x.device)
+
+        return TorchPreprocessingStepResult(
+            x=x,
+            added_columns=added,
+            added_modality=FeatureModality.NUMERICAL,
+            fitted_cache=fitted_cache,
+        )
+
+    @override
+    def _fit(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
+        n_rows = x.shape[0]
+        n_cols = x.shape[-1]
+        return {"n_cells": torch.tensor(n_rows * n_cols)}
+
+    @override
+    def _transform(
+        self,
+        x: torch.Tensor,
+        fitted_cache: dict[str, torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor | None, FeatureModality | None]:
+        # Not called directly - fit_transform is overridden
+        raise NotImplementedError("Use fit_transform instead")

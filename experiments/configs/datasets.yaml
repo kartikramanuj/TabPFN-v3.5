@@ -1,0 +1,8 @@
+# Add one entry per dataset. The CLI's --data, --target, and --task options can
+# override these values when running a single experiment.
+datasets:
+  example:
+    path: experiments/datasets/raw/your_dataset.csv
+    target: target
+    task: classification
+    categorical_columns: []

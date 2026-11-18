@@ -1,0 +1,16 @@
+task: regression
+data_path: experiments/datasets/raw/your_dataset.csv
+target: target
+categorical_columns: []
+test_size: 0.2
+random_seeds: [17, 42, 2026]
+device: auto
+n_estimators: auto
+tabpfn_versions: [v2, v2.5, v2.6, v3, v3.5, v3.5-fast]
+baseline_models:
+  - dummy
+  - ridge
+  - random_forest
+  - extra_trees
+  - lightgbm
+metrics: [rmse, mae, r2]
