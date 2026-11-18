@@ -121,3 +121,8 @@ The TabPFN package code, license, notices, changelog, examples, and tests are re
 from the supplied `TabPFN-main` reference checkout (the reference `pyproject.toml`
 reports package version `10.2.0`). The original upstream README is available at
 [`docs/TABPFN-UPSTREAM-README.md`](docs/TABPFN-UPSTREAM-README.md).
+
+## Contribution:
+1. Sana Tejasri Lakshmi - 240041033
+2. Ramanuj Kartik       - 240041030
+3. Vaghasiya parl       - 240041037
