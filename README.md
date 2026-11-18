@@ -6,8 +6,7 @@ baselines on a tabular dataset. The upstream implementation, examples, documenta
 and tests are preserved in this repository. The experiment code is isolated in
 [`experiments/`](experiments/).
 
-The planned three-way contribution split is documented in
-[`CONTRIBUTION_PLAN.md`](CONTRIBUTION_PLAN.md).
+
 
 ## What is included
 
@@ -47,6 +46,21 @@ list numeric-coded categorical features in `categorical_columns` in the YAML con
 The runner drops only rows with a missing target. It leaves feature values intact for
 TabPFN and fits imputation and categorical encoding inside each baseline pipeline
 using that split's training data.
+
+TabPFN verification Setup:
+1) Create your account on Prior Lab
+2) Accept TabPFN licenses for all versions
+3) Obtain API key from account page
+4) Run
+```bash
+$env:TABPFN_TOKEN = "YOUR_API_KEY_HERE"
+```
+5) Verify authentication configuration run below command you should get - Token configured: True
+```bash
+python -c "import os; print('Token configured:', bool(os.getenv('TABPFN_TOKEN')))"
+```
+
+
 
 For classification:
 
